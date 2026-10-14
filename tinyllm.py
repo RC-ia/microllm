@@ -42,9 +42,9 @@ DEFAULT_CONFIG = {
     # Janela de 8192 caracteres: cabe a conversa inteira do corpus (resposta
     # máxima = 7.639 chars). O embedding posicional custa block_size*n_embd, então
     # n_layer cai para 4 para o total continuar na classe de 5M.
-    "n_layer": 8,
-    "n_head": 16,
-    "n_embd": 256,
+    "n_layer": 16,
+    "n_head": 32,
+    "n_embd": 512,
     "block_size": 8192,
     "dropout": 0.1,
     "vocab_size": 0,  # preenchido após construir o tokenizador
