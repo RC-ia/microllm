@@ -17,14 +17,17 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import sys
 from pathlib import Path
 
 try:
     import torch
+    import torch.distributed as dist
     import torch.nn as nn
     import torch.nn.functional as F
+    from torch.nn.parallel import DistributedDataParallel as DDP
     from torch.utils.checkpoint import checkpoint
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("PyTorch não encontrado. Execute: pip install torch") from exc
@@ -281,7 +284,7 @@ def sample_batch(ids_list: list[list[int]], batch: int, block: int,
 
 @torch.no_grad()
 def evaluate_loss(model: TinyGPT, ids_list: list[list[int]], batch: int, block: int,
-                  val_batches: int, device: torch.device, seed: int = 0) -> float:
+                 val_batches: int, device: torch.device, seed: int = 0) -> float:
     model.eval()
     rng = random.Random(seed)
     total = 0.0
@@ -293,9 +296,26 @@ def evaluate_loss(model: TinyGPT, ids_list: list[list[int]], batch: int, block: 
 
 
 # ------------------------------------------------------------------ comandos
+def setup_distributed() -> tuple[int, int]:
+    if dist.is_available() and not dist.is_initialized():
+        world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+        if world_size > 1:
+            backend = "nccl" if torch.cuda.is_available() else "gloo"
+            dist.init_process_group(backend=backend)
+    if dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
 def resolve_device(name: str) -> torch.device:
     if name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            local_rank = int(os.environ.get("LOCAL_RANK", "0") or "0")
+            return torch.device(f"cuda:{local_rank}")
+        return torch.device("cpu")
+    if name == "cuda":
+        local_rank = int(os.environ.get("LOCAL_RANK", "0") or "0")
+        return torch.device(f"cuda:{local_rank}")
     return torch.device(name)
 
 
@@ -310,12 +330,20 @@ def command_params(args) -> None:
 
 
 def command_train(args) -> None:
+    rank, world_size = setup_distributed()
+    device = resolve_device(args.device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    torch.manual_seed(args.seed + rank)
+    random.seed(args.seed + rank)
+
     device = resolve_device(args.device)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
+
     dataset = Path(args.dataset)
     tokenizer, all_ids = build_corpus(dataset)
-    rng = random.Random(args.seed)
+    rng = random.Random(args.seed + rank)
     rng.shuffle(all_ids)
     cut = max(1, int(len(all_ids) * 0.9))
     train_ids, val_ids = all_ids[:cut], all_ids[cut:]
@@ -325,11 +353,14 @@ def command_train(args) -> None:
                   block_size=args.block, dropout=args.dropout,
                   grad_checkpoint=not args.no_grad_checkpoint)
     model = TinyGPT(config).to(device)
+    if dist.is_initialized():
+        model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
     total = count_parameters(model)
-    print(f"parâmetros: {total} ({total/1e6:.2f}M) | vocab: {tokenizer.vocab_size} | "
-          f"treino: {len(train_ids)} conversas (~{train_chars} chars) | val: {len(val_ids)} | device: {device}")
-    print(f"janela: {args.block} chars | batch: {args.batch} | "
-          f"grad_checkpoint: {config['grad_checkpoint']}")
+    if rank == 0:
+        print(f"parâmetros: {total} ({total/1e6:.2f}M) | vocab: {tokenizer.vocab_size} | "
+              f"treino: {len(train_ids)} conversas (~{train_chars} chars) | val: {len(val_ids)} | device: {device}")
+        print(f"janela: {args.block} chars | batch: {args.batch} | "
+              f"grad_checkpoint: {config['grad_checkpoint']}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                                   weight_decay=0.1)
@@ -363,8 +394,9 @@ def command_train(args) -> None:
         restore_rng_state(blob.get("rng"))
         start_step = int(blob.get("step", 0)) + 1
         best_val = float(blob.get("best_val", blob.get("val_loss", float("inf"))))
-        print(f"retomando de '{args.resume}' no passo {start_step}/{args.steps} "
-              f"(melhor val_loss até agora: {best_val:.4f}, tag='{blob.get('tag', '')}')")
+        if rank == 0:
+            print(f"retomando de '{args.resume}' no passo {start_step}/{args.steps} "
+                  f"(melhor val_loss até agora: {best_val:.4f}, tag='{blob.get('tag', '')}')")
         if start_step > args.steps:
             raise SystemExit(f"o checkpoint já está no passo {start_step - 1}, que é >= "
                              f"--steps {args.steps}; aumente --steps para continuar.")
@@ -391,12 +423,12 @@ def command_train(args) -> None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         loss_value = total_loss
-        if step % args.log_every == 0 or step == 1:
+        if rank == 0 and (step % args.log_every == 0 or step == 1):
             vram = (torch.cuda.max_memory_allocated() / 2**30
                     if device.type == "cuda" else 0.0)
             print(f"step {step}/{args.steps} loss={loss_value:.4f} "
                   f"ppl={math.exp(min(20.0, loss_value)):.1f} vram={vram:.2f}GB", flush=True)
-        if step % args.eval_every == 0 or step == args.steps:
+        if rank == 0 and (step % args.eval_every == 0 or step == args.steps):
             val = evaluate_loss(model, val_ids, args.batch, args.block, args.val_batches, device)
             print(f"  [eval] step {step} val_loss={val:.4f} val_ppl={math.exp(min(20.0, val)):.1f}", flush=True)
             if val < best_val:
@@ -406,10 +438,11 @@ def command_train(args) -> None:
                                 best_val=best_val, tag=args.tag)
                 print(f"  [eval] novo melhor checkpoint salvo em {args.out}", flush=True)
             model.train()
-    save_checkpoint(args.out, model, tokenizer, config, args.steps, best_val,
-                    optimizer=optimizer, rng_state=capture_rng_state(),
-                    best_val=best_val, tag=args.tag)
-    print(f"treino concluído. checkpoint final: {args.out} (melhor val_loss={best_val:.4f})")
+    if rank == 0:
+        save_checkpoint(args.out, model, tokenizer, config, args.steps, best_val,
+                        optimizer=optimizer, rng_state=capture_rng_state(),
+                        best_val=best_val, tag=args.tag)
+        print(f"treino concluído. checkpoint final: {args.out} (melhor val_loss={best_val:.4f})")
 
 
 def save_checkpoint(path: str, model: TinyGPT, tokenizer: CharTokenizer,
@@ -423,8 +456,14 @@ def save_checkpoint(path: str, model: TinyGPT, tokenizer: CharTokenizer,
     ordem dos dados muda. Checkpoints antigos (sem esses campos) continuam
     carregando — apenas retomam com esses dois zerados.
     """
+    # Em execução distribuída, só o rank 0 salva para evitar colisões no mesmo arquivo.
+    # O modelo em DDP ainda envia state_dict sem wrappers, então o save funciona.
+    if isinstance(model, DDP):
+        model_to_save = model.module
+    else:
+        model_to_save = model
     blob = {"config": config, "stoi": tokenizer.stoi, "itos": tokenizer.itos,
-            "model": {k: v.cpu() for k, v in model.state_dict().items()},
+            "model": {k: v.cpu() for k, v in model_to_save.state_dict().items()},
             "step": step, "val_loss": val_loss, "tag": tag,
             "best_val": best_val if best_val is not None else val_loss}
     if optimizer is not None:
